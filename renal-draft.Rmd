@@ -1,0 +1,235 @@
+---
+title: "Draft"
+author: "Patrick K"
+date: "6/14/2026"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+#### load packages 
+```{r}
+
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(MatchIt)
+```
+
+```{r}
+
+encounters = read.csv("encounter.csv", nrows = 50000)
+patient = read.csv("patient.csv", nrows = 50000)
+lab_results = read.csv("lab_result.csv", nrows = 50000)
+tumor = read.csv("tumor.csv", nrows = 50000)
+diagnosis = read.csv("diagnosis.csv", nrows = 50000)
+encounters = read.csv("encounter.csv", nrows = 50000)
+procedure = read.csv("procedure.csv", nrows = 50000)
+med_ing = read.csv("medication_ingredient.csv", nrows = 50000)
+```
+
+
+```{r}
+
+# ==========================================
+# 1. DEFINE TARGET CODES & TERMS
+# ==========================================
+rcc_codes <- c("C64") 
+mets_stage4_codes <- c("C77", "C78", "C7B", "C65")
+stage4_terms <- c("Stage 4", "S4", "M1", "TNM_M1")
+
+# Radical Nephrectomy, Dialysis, and Transplant codes
+prior_renal_codes <- c(
+  "Z99.2", "90935", "90937", "90945", "90947", "Z94.0", "50360", "50365", 
+  "50230", "50545", "175905003", "50546", "50548", "116033007", "446296004", "439235001"
+)
+
+# Partial Nephrectomy & Ablation codes
+intervention_codes <- c(
+  "50240", "360797007", "81516001", "439739008", "51870000", "50543", 
+  "175918006", "175917001", "708929007", "1119317007", "1119318002",
+  "716009005", "50592", "50593"
+)
+
+
+# ==========================================
+# 2. COMBINE DIAGNOSES & PROCEDURES INTO ONE TIMELINE
+# ==========================================
+# Standardize and stack the tables so we look at everything chronologically
+clinical_timeline <- bind_rows(
+  diagnosis %>% select(patient_id, date, code, code_system),
+  procedure %>% select(patient_id, date, code, code_system)
+) %>%
+  # Convert integer date to R Date format
+  mutate(record_date = ymd(as.character(date))) %>%
+  
+  # Join patient demographics to calculate age at the event time
+  left_join(
+    patient %>% select(patient_id, year_of_birth), 
+    by = "patient_id"
+  ) %>%
+  mutate(age_at_record = year(record_date) - year_of_birth)
+
+
+# ==========================================
+# 3. RUN THE COHORT COHORT LOGIC
+# ==========================================
+final_cohort <- clinical_timeline %>%
+  group_by(patient_id) %>%
+  mutate(
+    # --- STEP 1: Identify the Index RCC Date ---
+    # Strip decimals (e.g., C64.1 -> C64) to cleanly match core ICD codes
+    is_rcc = (sub("\\..*", "", code) %in% rcc_codes) & age_at_record >= 18,
+    rcc_index_date = min(record_date[is_rcc], na.rm = TRUE),
+    
+    # --- STEP 2: Group 1B Exclusions (Before or up to 3 months after index) ---
+    has_mets_exclusion = any(
+      (sub("\\..*", "", code) %in% mets_stage4_codes | code %in% stage4_terms) & 
+        (record_date <= (rcc_index_date + months(3)))
+    ),
+    
+    # --- STEP 3: Group 2B Exclusions (On or before index) ---
+    has_renal_exclusion = any(
+      code %in% prior_renal_codes & 
+        (record_date <= rcc_index_date)
+    ),
+    
+    # --- STEP 4: Group 3A / 4A Interventions (Any time) ---
+    has_intervention = any(
+      code %in% intervention_codes | 
+        grepl("^(0TB|0TT|0T5)", code) # Captures the ICD-10-PCS wildcards
+    )
+  ) %>%
+  
+  # --- STEP 5: Filter down to Cohort ---
+  filter(
+    !is.na(rcc_index_date),   # Must have a valid adult RCC diagnosis
+    !has_mets_exclusion,      # Drop patients with early advanced disease
+    !has_renal_exclusion,     # Drop patients with pre-existing end-stage renal / radical nx records
+    has_intervention          # Must have a partial nephrectomy or ablation recorded
+  ) %>%
+  ungroup()
+
+head(final_cohort)
+
+```
+
+
+```{r}
+## patient demographics
+
+
+## bring in patient data
+cohort_demographics <- final_cohort %>%
+  distinct(patient_id, .keep_all = TRUE) %>%
+  select(patient_id, rcc_index_date) %>%
+  inner_join(patient, by = "patient_id") %>%
+  mutate(
+    age_at_index = year(rcc_index_date) - year_of_birth,
+    sex = ifelse(sex %in% c("Unknown", "U", ""), "Unknown", sex),
+    race = ifelse(race %in% c("Unknown", "U", ""), "Unknown", race),
+    
+    has_died = !is.na(month_year_death),
+    
+    # Safe date parsing that won't throw warnings for living patients
+    death_date = if_else(
+      !is.na(month_year_death),
+      ymd(paste0(month_year_death, "01")),
+      as.Date(NA)
+    )
+  ) %>%
+  select(
+    patient_id, rcc_index_date, age_at_index, sex, 
+    race, ethnicity, regional_location = patient_regional_location, 
+    has_died, death_date
+  )
+
+head(cohort_demographics)
+```
+
+
+```{r}
+
+# ==========================================
+# 1. IDENTIFY TREATMENT GROUPS & INDEX DATES
+# ==========================================
+treatment_groups <- final_cohort %>%
+  filter(code %in% intervention_codes | grepl("^(0TB|0TT|0T5)", code)) %>%
+  group_by(patient_id) %>%
+  filter(record_date == min(record_date)) %>% 
+  distinct(patient_id, .keep_all = TRUE) %>%
+  mutate(
+    treatment_type = if_else(grepl("^(0T5)", code) | code %in% c("716009005", "50592", "50593"), "IR_Ablation", "PNX"),
+    treatment_date = record_date
+  ) %>%
+  select(patient_id, treatment_type, treatment_date)
+
+head(treatment_groups)
+```
+
+
+```{r}
+
+# ==========================================
+# 2. EXTRACT PRE-OP BASELINE RENAL LABS
+# ==========================================
+renal_loincs <- c("2160-0", "10466-1") 
+
+biomarker_baseline <- lab_results %>%
+  mutate(lab_date = ymd(as.character(date))) %>%
+  filter(code %in% renal_loincs) %>%
+  inner_join(treatment_groups, by = "patient_id") %>%
+  mutate(days_before_treatment = as.numeric(treatment_date - lab_date)) %>%
+  # Lookback window: 0 to 90 days prior to treatment
+  filter(days_before_treatment >= 0 & days_before_treatment <= 90) %>%
+  group_by(patient_id) %>%
+  filter(days_before_treatment == min(days_before_treatment)) %>%
+  distinct(patient_id, .keep_all = TRUE) %>%
+  select(patient_id, baseline_renal_val = lab_result_num_val)
+head(biomarker_baseline)
+
+
+# ==========================================
+# 3. MERGE DEMOGRAPHICS + TREATMENT + LABS
+# ==========================================
+matching_clean <- cohort_demographics %>%
+  # Bring in the treatment arm assignment
+  inner_join(treatment_groups, by = "patient_id") %>%
+  # Bring in the baseline lab values explicitly
+  inner_join(biomarker_baseline, by = "patient_id") %>% 
+  # Eliminate missing values or "Unknown" text values across all covariates
+  drop_na(baseline_renal_val, age_at_index, sex, race) %>% 
+  filter(
+    sex != "Unknown",
+    race != "Unknown"
+  ) %>%
+  # Convert treatment type to a binary numeric format (0/1) for MatchIt
+  mutate(
+    treatment_binary = if_else(treatment_type == "IR_Ablation", 1, 0)
+  )
+head(matching_clean)
+```
+
+```{r}
+
+# ==========================================
+# 4. PROPENSITY SCORE MATCHING
+# ==========================================
+# Run MatchIt with a 0.2 standard deviation caliper
+match_model <- matchit(
+  treatment_binary ~ age_at_index + sex + race + baseline_renal_val, 
+  data = matching_clean,
+  method = "nearest", 
+  caliper = 0.2,            
+  replace = FALSE
+)
+
+# View the balance tables (Sample Sizes, Mean Differences)
+summary(match_model)
+matched_data
+```
+
